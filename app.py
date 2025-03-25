@@ -33,14 +33,23 @@ st.markdown(
 # ------------------------------
 @st.cache_resource(show_spinner=False)
 def get_connection():
-    return snowflake.connector.connect(
-        user=st.secrets["snowflake"]["user"],
-        password=st.secrets["snowflake"]["password"],
-        account=st.secrets["snowflake"]["account"],
-        warehouse=st.secrets["snowflake"]["warehouse"],
-        database=st.secrets["snowflake"]["database"],
-        schema=st.secrets["snowflake"]["schema"]
-    )
+    try:
+        private_key_p8 = st.secrets["snowflake"]["private_key"]
+        # private_key_base64 = st.secrets["snowflake"]["private_key"]
+        # private_key_p8 = base64.b64decode(private_key_base64).decode("utf-8")
+        
+        return snowflake.connector.connect(
+            user=st.secrets["snowflake"]["user"],
+            # password=st.secrets["snowflake"]["password"],
+            account=st.secrets["snowflake"]["account"],
+            warehouse=st.secrets["snowflake"]["warehouse"],
+            database=st.secrets["snowflake"]["database"],
+            schema=st.secrets["snowflake"]["schema"],
+            private_key=private_key_p8
+        )
+    except Exception as e:
+        st.error(f"Failed to connect to Snowflake: {e}")
+        return None
 
 # ------------------------------
 # Get column names from a table (returns list of column names)
