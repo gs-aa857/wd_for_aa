@@ -644,7 +644,7 @@ if "df" in st.session_state:
         st.download_button(
             label="Download as Excel",
             data=towrite,
-            file_name="weather_data.xlsx",
+            file_name="import_data.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
