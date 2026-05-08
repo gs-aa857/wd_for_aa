@@ -44,7 +44,7 @@ def get_connection():
         return None
 
 # ------------------------------
-# Get column names from a table
+# Get column names from a table/view
 # ------------------------------
 def get_table_columns(table_name):
     query = (
@@ -62,24 +62,152 @@ def get_table_columns(table_name):
         st.error(f"Error retrieving columns: {e}")
         return []
 
+# ------------------------------
+# Map frequency to enhanced view name and join keys
+# ------------------------------
+ENHANCED_VIEW = {
+    "Daily":  {
+        "table":      "weather_daily_deviations",
+        "date_col":   "RECORD_DATE",
+        "join_on":    ["RECORD_DATE", "COUNTRY_CODE"],
+        # Columns that are already in the base view — exclude from selectable list
+        "exclude":    {
+            "DAILY_WEATHER_ID", "RECORD_DATE", "COUNTRY_CODE", "DOY",
+            "TEMP_AVG", "TEMP_MIN", "TEMP_MAX",
+            "APP_TEMP_AVG", "APP_TEMP_MIN", "APP_TEMP_MAX",
+            "RAIN_SUM", "SNOWFALL_SUM", "SNOW_DEPTH_AVG", "SNOW_DEPTH_MAX",
+            "CLOUD_COVER_AVG", "WIND_SPEED_AVG", "WIND_GUSTS_MAX",
+            "WET_BULB_TEMP_AVG", "SUNSHINE_DURATION",
+            "SW_RAD_AVG", "SW_RAD_MAX",
+            "DIRECT_RAD_AVG", "DIRECT_RAD_MAX",
+            "DIFFUSE_RAD_AVG", "DIFFUSE_RAD_MAX",
+        },
+    },
+    "Weekly": {
+        "table":      "weather_weekly_deviations",
+        "date_col":   "RECORD_WEEK",
+        "join_on":    ["RECORD_WEEK", "COUNTRY_CODE"],
+        "exclude":    {
+            "WEEKLY_WEATHER_ID", "RECORD_WEEK", "COUNTRY_CODE",
+            "TEMP_AVG", "TEMP_AVG_HIGH", "TEMP_MIN", "TEMP_MAX",
+            "APP_TEMP_AVG", "APP_TEMP_AVG_HIGH", "APP_TEMP_MIN", "APP_TEMP_MAX",
+            "RAIN_AVG", "RAIN_SUM", "SNOWFALL_AVG", "SNOWFALL_SUM",
+            "SNOW_DEPTH_AVG", "SNOW_DEPTH_AVG_HIGH", "SNOW_DEPTH_MAX",
+            "CLOUD_COVER_AVG", "WIND_SPEED_AVG", "WIND_GUSTS_MAX",
+            "WIND_GUSTS_AVG_HIGH", "WET_BULB_TEMP_AVG",
+            "SUNSHINE_DURATION_AVG", "SUNSHINE_DURATION_MIN", "SUNSHINE_DURATION_MAX",
+            "SW_RAD_AVG", "SW_RAD_AVG_HIGH", "SW_RAD_MAX",
+            "DIRECT_RAD_AVG", "DIRECT_RAD_AVG_HIGH", "DIRECT_RAD_MAX",
+            "DIFFUSE_RAD_AVG", "DIFFUSE_RAD_AVG_HIGH", "DIFFUSE_RAD_MAX",
+        },
+    },
+}
+
+# Seasonal anomaly config — always daily join via period_start/end
+SEASONAL_ANOMALY_VIEW = "weather_seasonal_anomaly"
+
+# ------------------------------
+# Query additional variables from enhanced view
+# ------------------------------
+def query_enhanced(
+    table_name: str,
+    date_col: str,
+    selected_cols: list,
+    country: str,
+    start_date: datetime.date,
+    end_date: datetime.date,
+) -> pd.DataFrame:
+    cols = ", ".join(["COUNTRY_CODE", date_col] + selected_cols)
+    query = f"""
+        SELECT {cols}
+        FROM {st.secrets['snowflake']['database']}.{st.secrets['snowflake']['schema']}.{table_name}
+        WHERE COUNTRY_CODE = '{country}'
+          AND {date_col} BETWEEN '{start_date}' AND '{end_date}'
+        ORDER BY {date_col}
+    """
+    try:
+        conn = get_connection()
+        return pd.read_sql(query, conn)
+    except Exception as e:
+        st.error(f"Error retrieving enhanced weather data: {e}")
+        return pd.DataFrame()
+
+# ------------------------------
+# Query seasonal anomaly
+# ------------------------------
+def query_seasonal_anomaly(
+    selected_cols: list,
+    country: str,
+    start_date: datetime.date,
+    end_date: datetime.date,
+    period_type: str,  # 'MONTH' or 'SEASON'
+) -> pd.DataFrame:
+    cols = ", ".join(
+        ["COUNTRY_CODE", "PERIOD_TYPE", "PERIOD_START_DATE", "PERIOD_END_DATE"]
+        + selected_cols
+    )
+    query = f"""
+        SELECT {cols}
+        FROM {st.secrets['snowflake']['database']}.{st.secrets['snowflake']['schema']}.{SEASONAL_ANOMALY_VIEW}
+        WHERE COUNTRY_CODE = '{country}'
+          AND PERIOD_TYPE = '{period_type}'
+          AND PERIOD_START_DATE <= '{end_date}'
+          AND PERIOD_END_DATE   >= '{start_date}'
+        ORDER BY PERIOD_START_DATE
+    """
+    try:
+        conn = get_connection()
+        return pd.read_sql(query, conn)
+    except Exception as e:
+        st.error(f"Error retrieving seasonal anomaly data: {e}")
+        return pd.DataFrame()
+
+# ------------------------------
+# Join seasonal anomaly to daily/weekly df via date range
+# ------------------------------
+def merge_seasonal_anomaly(
+    base_df: pd.DataFrame,
+    date_col: str,
+    anomaly_df: pd.DataFrame,
+    selected_cols: list,
+) -> pd.DataFrame:
+    if anomaly_df.empty:
+        return base_df
+
+    anomaly_df = anomaly_df.copy()
+    anomaly_df["PERIOD_START_DATE"] = pd.to_datetime(anomaly_df["PERIOD_START_DATE"])
+    anomaly_df["PERIOD_END_DATE"]   = pd.to_datetime(anomaly_df["PERIOD_END_DATE"])
+
+    result = base_df.copy()
+    result[date_col] = pd.to_datetime(result[date_col])
+
+    # For each anomaly column, map value onto each date that falls in its window
+    for col in selected_cols:
+        renamed = f"OTHER-WeatherAnomaly_{col}"
+        result[renamed] = None
+        for _, row in anomaly_df.iterrows():
+            mask = (
+                (result[date_col] >= row["PERIOD_START_DATE"]) &
+                (result[date_col] <= row["PERIOD_END_DATE"])
+            )
+            result.loc[mask, renamed] = row[col]
+
+    return result
+
+
 # ============================================================
 # SEASONALITY GENERATORS  (pure Python / pandas)
 # ============================================================
-
-# --- helpers -----------------------------------------------------------
 
 def _date_series(start: datetime.date, end: datetime.date) -> pd.Series:
     return pd.Series(pd.date_range(start, end, freq="D"), name="date")
 
 
 def _week_series(start: datetime.date, end: datetime.date) -> pd.Series:
-    """Return Monday-anchored week-start dates covering [start, end]."""
     s = pd.Timestamp(start) - pd.tseries.offsets.Week(weekday=0)
     e = pd.Timestamp(end)
     return pd.Series(pd.date_range(s, e, freq="W-MON"), name="date")
 
-
-# --- daily seasonality -------------------------------------------------
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
@@ -91,10 +219,7 @@ def build_daily_seasonality(start: datetime.date, end: datetime.date) -> pd.Data
     return df
 
 
-# --- weekly seasonality ------------------------------------------------
-
 def _iso_month_week1_start(thursday: pd.Timestamp) -> pd.Timestamp:
-    """Monday of the first ISO week of thursday's month (uses day-4 anchor)."""
     first_thu = pd.Timestamp(thursday.year, thursday.month, 4)
     return first_thu - pd.tseries.offsets.Week(weekday=0)
 
@@ -102,13 +227,6 @@ def _iso_month_week1_start(thursday: pd.Timestamp) -> pd.Timestamp:
 def build_weekly_seasonality(
     start: datetime.date, end: datetime.date, expand_to_daily: bool = False
 ) -> pd.DataFrame:
-    """
-    Build weekly seasonality dummies.
-
-    When expand_to_daily=True (Daily frequency selected), each week's values
-    are broadcast to all 7 days (Mon-Sun) so the result aligns to a daily grid.
-    When False (Weekly frequency), one row per week-start Monday is returned.
-    """
     weeks = _week_series(start, end)
     week_rows = []
     for week_start in weeks:
@@ -159,8 +277,6 @@ def build_weekly_seasonality(
     return df.reset_index(drop=True)
 
 
-# --- monthly seasonality -----------------------------------------------
-
 MONTHS = [
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December"
@@ -179,7 +295,6 @@ def build_monthly_seasonality(start: datetime.date, end: datetime.date) -> pd.Da
 # ============================================================
 
 def _nth_weekday(year: int, month: int, weekday: int, n: int) -> datetime.date:
-    """Return the n-th occurrence (1-based) of weekday (0=Mon) in month/year."""
     first = datetime.date(year, month, 1)
     delta = (weekday - first.weekday()) % 7
     first_occurrence = first + datetime.timedelta(days=delta)
@@ -187,7 +302,6 @@ def _nth_weekday(year: int, month: int, weekday: int, n: int) -> datetime.date:
 
 
 def _last_weekday(year: int, month: int, weekday: int) -> datetime.date:
-    """Return the last occurrence of weekday in month/year."""
     if month == 12:
         last = datetime.date(year + 1, 1, 1) - datetime.timedelta(days=1)
     else:
@@ -197,33 +311,19 @@ def _last_weekday(year: int, month: int, weekday: int) -> datetime.date:
 
 
 def _dst_start(year: int) -> datetime.date:
-    """EU DST start: last Sunday of March."""
     return _last_weekday(year, 3, 6)
 
 
 def _dst_end(year: int) -> datetime.date:
-    """EU DST end: last Sunday of October."""
     return _last_weekday(year, 10, 6)
 
 
 def _black_weekend_dates(year: int) -> list:
-    """Black Friday + Saturday + Sunday (the 'Black & Cyber Weekend' window)."""
-    black_friday = _nth_weekday(year, 11, 4, 4)  # 4th Friday of November
+    black_friday = _nth_weekday(year, 11, 4, 4)
     return [black_friday + datetime.timedelta(days=i) for i in range(3)]
 
 
 def _e_esmaspaev_dates(year: int) -> list:
-    """E-esmaspäev (EE only) - official campaign dates, 4x per year.
-
-    History (sourced from Estonian E-Commerce Association announcements):
-      2014: Nov 10          (inaugural; 2nd Mon of Nov)
-      2015-2022: 2nd Mon of May + 2nd Mon of Nov  (twice/year)
-      2023+: 2nd Mon of March, May, September, November  (four/year)
-
-    Hard-coded known dates are used for 2014-2025 where confirmed.
-    For 2026+ the rule "2nd Monday of Mar/May/Sep/Nov" is applied algorithmically.
-    """
-    # Hard-coded confirmed dates (verified against official EKL announcements)
     KNOWN = {
         2014: [datetime.date(2014, 11, 10)],
         2015: [datetime.date(2015,  5, 11), datetime.date(2015, 11,  9)],
@@ -243,12 +343,10 @@ def _e_esmaspaev_dates(year: int) -> list:
     }
     if year in KNOWN:
         return KNOWN[year]
-    # 2026+: 2nd Monday of March, May, September, November
     return [_nth_weekday(year, m, 0, 2) for m in (3, 5, 9, 11)]
 
 
 def _easter(year: int) -> datetime.date:
-    """Anonymous Gregorian algorithm for Easter Sunday."""
     a = year % 19
     b = year // 100
     c = year % 100
@@ -266,73 +364,43 @@ def _easter(year: int) -> datetime.date:
     return datetime.date(year, month, day)
 
 
-# ---------------------------------------------------------------------------
-# OBSERVANCE_RULES
-#   key   = output column name
-#   value = lambda(year, country_code) -> datetime.date | list[datetime.date] | None
-#   Return None to skip for a given country/year.
-#   Return a list to mark multiple dates under one column name (e.g. weekends).
-# ---------------------------------------------------------------------------
 OBSERVANCE_RULES = {
-    # Mothers Day: 2nd Sunday of May
     "H-Mothers Day":             lambda y, cc: _nth_weekday(y, 5, 6, 2),
-    # Fathers Day: 2nd Sunday of November
     "H-Fathers Day":             lambda y, cc: _nth_weekday(y, 11, 6, 2),
-    # Valentines Day: Feb 14
     "H-Valentines Day":          lambda y, cc: datetime.date(y, 2, 14),
-    # Easter Sunday
     "H-Easter Sunday":           lambda y, cc: _easter(y),
-    # Easter Monday
     "H-Easter Monday":           lambda y, cc: _easter(y) + datetime.timedelta(days=1),
-    # Good Friday
     "H-Good Friday":             lambda y, cc: _easter(y) - datetime.timedelta(days=2),
-    # Pentecost / Nelipühade 1. püha: 49 days after Easter (all countries)
     "H-Pentecost":               lambda y, cc: _easter(y) + datetime.timedelta(days=49),
-    # Midsummer Eve: Jun 23 (EE/LV/LT) | 3rd Friday of Jun, covering 19-25 (FI)
     "H-Midsummer Eve":           lambda y, cc: (
         _nth_weekday(y, 6, 4, 3) if cc == "FI" else datetime.date(y, 6, 23)
     ),
-    # Halloween: Oct 31
     "H-Halloween":               lambda y, cc: datetime.date(y, 10, 31),
-    # Christmas Eve: Dec 24
     "H-Christmas Eve":           lambda y, cc: datetime.date(y, 12, 24),
-    # Christmas Day: Dec 25
     "H-Christmas Day":           lambda y, cc: datetime.date(y, 12, 25),
-    # Boxing Day / 2nd Christmas: Dec 26
     "H-Boxing Day":              lambda y, cc: datetime.date(y, 12, 26),
-    # New Years Eve: Dec 31
     "H-New Years Eve":           lambda y, cc: datetime.date(y, 12, 31),
-    # New Years Day: Jan 1
     "H-New Years Day":           lambda y, cc: datetime.date(y, 1, 1),
-    # Black Friday: 4th Friday of November
     "H-Black Friday":            lambda y, cc: _nth_weekday(y, 11, 4, 4),
-    # Black and Cyber Weekend: Black Friday + Sat + Sun (list of 3 dates)
     "H-Black and Cyber Weekend": lambda y, cc: _black_weekend_dates(y),
-    # Cyber Monday: Monday after Black Friday (3 days after)
     "H-Cyber Monday":            lambda y, cc: _nth_weekday(y, 11, 4, 4) + datetime.timedelta(days=3),
-    # DST Start (EU): last Sunday of March
     "H-DST Start":               lambda y, cc: _dst_start(y),
-    # DST End (EU): last Sunday of October
     "H-DST End":                 lambda y, cc: _dst_end(y),
-    # E-esmaspaev: EE only, 2-4 dates/year (hard-coded confirmed dates; 2nd Mon of Mar/May/Sep/Nov from 2023+)
     "H-E-esmaspaev":             lambda y, cc: _e_esmaspaev_dates(y) if cc == "EE" else None,
 }
 
-# Country-specific public holidays with fixed calendar dates
 COUNTRY_FIXED_HOLIDAYS = {
     "EE": {
         "H-Independence Day":          (2, 24),
         "H-Victory Day":               (6, 23),
         "H-Restoration Day":           (8, 20),
         "H-Christmas Day (2nd)":       (12, 26),
-        # School year starts Sep 1 in EE
         "H-Beginning of School Year":  (9, 1),
     },
     "LV": {
         "H-Independence Day":          (11, 18),
         "H-Restoration Day":           (5, 4),
         "H-Lacplesis Day":             (11, 11),
-        # School year starts Sep 1 in LV
         "H-Beginning of School Year":  (9, 1),
     },
     "LT": {
@@ -340,14 +408,12 @@ COUNTRY_FIXED_HOLIDAYS = {
         "H-Restoration Day":           (3, 11),
         "H-Statehood Day":             (7, 6),
         "H-All Saints Day":            (11, 1),
-        # School year starts Sep 1 in LT
         "H-Beginning of School Year":  (9, 1),
     },
     "FI": {
         "H-Independence Day":          (12, 6),
         "H-Epiphany":                  (1, 6),
         "H-All Saints Day":            (11, 1),
-        # FI school year start not included: no single fixed national date
     },
 }
 
@@ -363,18 +429,9 @@ def build_special_dates(
     frequency: str,
     country_code: str,
 ) -> pd.DataFrame:
-    """
-    Build a DataFrame of 0/1 special-date dummies aligned to the date
-    grid used by `frequency` ('Daily' or 'Weekly').
-    Rules returning a list mark all dates in that list as 1.
-    Rules returning None are skipped for that country.
-    """
     years = range(start.year, end.year + 1)
-
-    # Collect column_name -> set of relevant dates
     holiday_dates: dict = {}
 
-    # Observance rules (may return single date, list, or None)
     for col, rule in OBSERVANCE_RULES.items():
         holiday_dates[col] = set()
         for y in years:
@@ -390,7 +447,6 @@ def build_special_dates(
             except Exception:
                 pass
 
-    # Country-specific fixed holidays
     for col, (m, day) in COUNTRY_FIXED_HOLIDAYS.get(country_code, {}).items():
         holiday_dates[col] = set()
         for y in years:
@@ -399,7 +455,6 @@ def build_special_dates(
             except Exception:
                 pass
 
-    # Shared fixed holidays
     for col, (m, day) in SHARED_FIXED.items():
         holiday_dates[col] = set()
         for y in years:
@@ -408,17 +463,15 @@ def build_special_dates(
             except Exception:
                 pass
 
-    # Build the date grid
     if frequency == "Daily":
         dates = _date_series(start, end)
         df = pd.DataFrame({"DATE_NAME": dates})
         date_col = df["DATE_NAME"].dt.date
-    else:  # Weekly
+    else:
         weeks = _week_series(start, end)
         df = pd.DataFrame({"DATE_NAME": weeks})
-        date_col = None  # handled per column below
+        date_col = None
 
-    # Fill dummies
     all_cols = sorted(holiday_dates.keys())
     if frequency == "Daily":
         for col in all_cols:
@@ -427,16 +480,13 @@ def build_special_dates(
     else:
         for col in all_cols:
             hset = holiday_dates[col]
-
             def week_hit(week_start, hset=hset):
                 for delta in range(7):
                     if (week_start + pd.Timedelta(days=delta)).date() in hset:
                         return 1
                 return 0
-
             df[col] = df["DATE_NAME"].apply(week_hit)
 
-    # Filter to [start, end]
     df = df[(df["DATE_NAME"].dt.date >= start) & (df["DATE_NAME"].dt.date <= end)]
     return df.reset_index(drop=True)
 
@@ -450,7 +500,6 @@ def merge_seasonality(
     date_col: str,
     seasonality_dfs: list,
 ) -> pd.DataFrame:
-    """Left-join all seasonality DataFrames onto the weather DataFrame."""
     result = weather_df.copy()
     result[date_col] = pd.to_datetime(result[date_col])
 
@@ -525,6 +574,74 @@ else:
         "Select Weather Columns", options=selectable_columns, default=default_select
     )
 
+# ── Additional Weather Variables ───────────────────────────────────────
+st.subheader("Additional Weather Variables")
+st.caption(
+    "Deviation and anomaly variables from enhanced views. "
+    "Deviations are vs the 1991–2020 climate normal for that day-of-year."
+)
+
+enhanced_cfg = ENHANCED_VIEW[frequency]
+enhanced_all_cols = get_table_columns(enhanced_cfg["table"])
+enhanced_selectable = [
+    col for col in enhanced_all_cols
+    if col not in enhanced_cfg["exclude"]
+]
+
+select_all_enhanced = st.checkbox("Select All Additional Columns", value=False)
+if select_all_enhanced:
+    selected_enhanced = st.multiselect(
+        "Select Additional Variables",
+        options=enhanced_selectable,
+        default=enhanced_selectable,
+    )
+else:
+    selected_enhanced = st.multiselect(
+        "Select Additional Variables",
+        options=enhanced_selectable,
+        default=[],
+    )
+
+# ── Seasonal Anomaly Variables ─────────────────────────────────────────
+st.subheader("Seasonal Anomaly Variables")
+st.caption(
+    "Month- or season-level anomalies vs the 1991–2020 baseline. "
+    "Each value is broadcast to all days/weeks within that period."
+)
+
+seasonal_period_type = st.radio(
+    "Seasonal Period Type",
+    options=["None", "MONTH", "SEASON"],
+    horizontal=True,
+)
+
+selected_seasonal = []
+if seasonal_period_type != "None":
+    seasonal_all_cols = get_table_columns(SEASONAL_ANOMALY_VIEW)
+    # Exclude identity/join columns from selection
+    seasonal_exclude = {
+        "COUNTRY_CODE", "PERIOD_TYPE", "PERIOD_YEAR", "PERIOD_VALUE",
+        "SEASON_CODE", "PERIOD_START_DATE", "PERIOD_END_DATE", "DAY_COUNT",
+    }
+    seasonal_selectable = [
+        col for col in seasonal_all_cols
+        if col not in seasonal_exclude
+    ]
+
+    select_all_seasonal = st.checkbox("Select All Seasonal Anomaly Columns", value=False)
+    if select_all_seasonal:
+        selected_seasonal = st.multiselect(
+            "Select Seasonal Anomaly Variables",
+            options=seasonal_selectable,
+            default=seasonal_selectable,
+        )
+    else:
+        selected_seasonal = st.multiselect(
+            "Select Seasonal Anomaly Variables",
+            options=seasonal_selectable,
+            default=[],
+        )
+
 # ── Seasonality options ────────────────────────────────────────────────
 st.subheader("Seasonality Variables")
 
@@ -544,7 +661,6 @@ selected_seas = st.multiselect(
     ),
 )
 
-# Special / holiday dates
 include_holidays = st.checkbox(
     "Include Special / Holiday Dates",
     value=False,
@@ -559,7 +675,7 @@ if st.button("Download Data"):
 
     range_start, range_end = date_range[0], date_range[1]
 
-    # --- Weather query ---
+    # --- Base weather query ---
     columns_to_select = hidden_columns + selected_columns
     query = f"""
         SELECT {', '.join(columns_to_select)}
@@ -576,14 +692,57 @@ if st.button("Download Data"):
         st.error(f"Error retrieving weather data: {e}")
         st.stop()
 
-    # --- Build seasonality DataFrames ---
-    seasonality_frames = []
+    # --- Enhanced variables ---
+    if selected_enhanced:
+        with st.spinner("Querying enhanced weather variables..."):
+            enhanced_df = query_enhanced(
+                table_name   = enhanced_cfg["table"],
+                date_col     = enhanced_cfg["date_col"],
+                selected_cols= selected_enhanced,
+                country      = country,
+                start_date   = range_start,
+                end_date     = range_end,
+            )
+        if not enhanced_df.empty:
+            enhanced_df[enhanced_cfg["date_col"]] = pd.to_datetime(
+                enhanced_df[enhanced_cfg["date_col"]]
+            )
+            df[date_column] = pd.to_datetime(df[date_column])
+            df = df.merge(
+                enhanced_df.drop(columns=["COUNTRY_CODE"], errors="ignore"),
+                left_on  = date_column,
+                right_on = enhanced_cfg["date_col"],
+                how      = "left",
+            )
+            # Drop duplicate date col if it appeared under a different name
+            if (
+                enhanced_cfg["date_col"] != date_column
+                and enhanced_cfg["date_col"] in df.columns
+            ):
+                df.drop(columns=[enhanced_cfg["date_col"]], inplace=True)
 
+    # --- Seasonal anomaly variables ---
+    if selected_seasonal and seasonal_period_type != "None":
+        with st.spinner("Querying seasonal anomaly variables..."):
+            anomaly_df = query_seasonal_anomaly(
+                selected_cols = selected_seasonal,
+                country       = country,
+                start_date    = range_start,
+                end_date      = range_end,
+                period_type   = seasonal_period_type,
+            )
+        df = merge_seasonal_anomaly(
+            base_df      = df,
+            date_col     = date_column,
+            anomaly_df   = anomaly_df,
+            selected_cols= selected_seasonal,
+        )
+
+    # --- Seasonality ---
+    seasonality_frames = []
     with st.spinner("Building seasonality variables..."):
         if "Daily" in selected_seas:
-            seasonality_frames.append(
-                build_daily_seasonality(range_start, range_end)
-            )
+            seasonality_frames.append(build_daily_seasonality(range_start, range_end))
         if "Weekly" in selected_seas:
             seasonality_frames.append(
                 build_weekly_seasonality(
@@ -592,19 +751,16 @@ if st.button("Download Data"):
                 )
             )
         if "Monthly" in selected_seas:
-            seasonality_frames.append(
-                build_monthly_seasonality(range_start, range_end)
-            )
+            seasonality_frames.append(build_monthly_seasonality(range_start, range_end))
         if include_holidays:
             seasonality_frames.append(
                 build_special_dates(range_start, range_end, frequency, country)
             )
 
-    # --- Merge ---
     if seasonality_frames:
         df = merge_seasonality(df, date_column, seasonality_frames)
 
-    # --- Rename weather columns to OTHER-Weather_{col} ---
+    # --- Rename weather columns ---
     weather_col_rename = {
         col: f"OTHER-Weather_{col}"
         for col in selected_columns
@@ -613,9 +769,18 @@ if st.button("Download Data"):
     df.rename(columns=weather_col_rename, inplace=True)
     renamed_weather_cols = list(weather_col_rename.values())
 
+    # --- Rename enhanced columns ---
+    enhanced_col_rename = {
+        col: f"OTHER-WeatherDev_{col}"
+        for col in selected_enhanced
+        if col in df.columns
+    }
+    df.rename(columns=enhanced_col_rename, inplace=True)
+    renamed_enhanced_cols = list(enhanced_col_rename.values())
+
     st.session_state["df"]               = df
     st.session_state["date_column"]      = date_column
-    st.session_state["selected_columns"] = renamed_weather_cols
+    st.session_state["selected_columns"] = renamed_weather_cols + renamed_enhanced_cols
 
     st.success("Data retrieved successfully!")
     st.dataframe(df)
@@ -626,7 +791,6 @@ if "df" in st.session_state:
     date_column      = st.session_state["date_column"]
     selected_columns = st.session_state.get("selected_columns", [])
 
-    # --- Download format ---
     download_format = st.radio("Select Download Format", options=["CSV", "Excel"])
     if download_format == "CSV":
         csv_data = df.to_csv(index=False).encode("utf-8")
@@ -648,7 +812,6 @@ if "df" in st.session_state:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    # --- Visualization ---
     if not df.empty and date_column in df.columns:
         st.subheader("Data Visualization")
         try:
@@ -656,7 +819,6 @@ if "df" in st.session_state:
         except Exception as e:
             st.error(f"Error converting {date_column} to datetime: {e}")
 
-        # Only plot numeric weather columns (skip binary seasonality dummies)
         plot_cols = [
             c for c in selected_columns
             if c in df.columns and pd.api.types.is_numeric_dtype(df[c])
